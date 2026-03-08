@@ -48,7 +48,6 @@ def main(algorithm_name, model_path):
     )
     
     prompts = [line['prompt'] for line in lines]
-    references = [line['natural_text'] for line in lines]
 
     # only implemented with_watermark_generation in vllm v1 for now
     # without_watermark_generation can be done by legacy code
