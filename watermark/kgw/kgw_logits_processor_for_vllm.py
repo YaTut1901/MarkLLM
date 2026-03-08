@@ -34,20 +34,16 @@ Output:    ' in the hands of the people.\n\nThe future of AI is in the'
 """
 
 from typing import Any
-from typing import Deque, Dict, List, Optional
 
 import torch
 
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 from vllm.config import VllmConfig
 from vllm.v1.sample.logits_processor import (
     BatchUpdate,
     LogitsProcessor,
     MoveDirectionality,
 )
-from vllm.v1.sample.logits_processor.builtin import process_dict_updates
-
-
 # Hypothetical custom logits processor
 class KGWLogitsProcessor(LogitsProcessor):
     """Fake logit processor to support unit testing and examples"""
