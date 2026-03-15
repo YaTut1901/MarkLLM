@@ -148,26 +148,31 @@ class KGWLogitsProcessor(LogitsProcessor):
                     window_ids, dtype=torch.long, device=logits.device
                 )
                 output_ids_matrix[i] = window_ids
+
+        vocab_size = logits.shape[-1]
+
+        # Lazily initialize RNG and the PRF permutation once, and reuse them.
+        if (not hasattr(self, "rng")) or self.rng is None or getattr(self.rng, "device", None) != logits.device or (not hasattr(self, "prf")) or self.prf is None or self.prf.numel() != vocab_size:
+            self.rng = torch.Generator(device=logits.device)
+            self.rng.manual_seed(15485863)
+            self.prf = torch.randperm(vocab_size, device=logits.device, generator=self.rng)
         
         batched_greenlist_ids = [None for _ in range(output_ids_matrix.shape[0])]
 
         for idx in range(output_ids_matrix.shape[0]):
             output_ids = output_ids_matrix[idx]
-            self.rng = torch.Generator(device=logits.device)
-            self.rng.manual_seed(15485863)
-            self.prf = torch.randperm(logits.shape[-1], device=logits.device, generator=self.rng)
 
             time_result = 1
             for i in range(0, window_size):
                 time_result *= output_ids[-1 - i].item()
-            num = self.prf[time_result % logits.shape[-1]]
+            num = self.prf[time_result % vocab_size]
         
-            self.rng.manual_seed((15485863 * int(num)) % logits.shape[-1])
-            greenlist_size = int(logits.shape[-1] * gamma)
-            vocab_permutation = torch.randperm(logits.shape[-1], device=logits.device, generator=self.rng)
+            self.rng.manual_seed((15485863 * int(num)) % vocab_size)
+            greenlist_size = int(vocab_size * gamma)
+            vocab_permutation = torch.randperm(vocab_size, device=logits.device, generator=self.rng)
             greenlist_ids = vocab_permutation[:greenlist_size]
             batched_greenlist_ids[idx] = greenlist_ids
-            # print(f"seed:{15485863 * int(num)}, num:{int(num)}, vocab_size:{logits.shape[-1]}, greenlist_size:{greenlist_size}")
+            # print(f"seed:{15485863 * int(num)}, num:{int(num)}, vocab_size:{vocab_size}, greenlist_size:{greenlist_size}")
 
         green_tokens_mask = torch.zeros_like(logits)
         for idx in range(len(batched_greenlist_ids)):
