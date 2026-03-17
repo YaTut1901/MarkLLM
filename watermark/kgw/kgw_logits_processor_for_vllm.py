@@ -52,29 +52,31 @@ class KGWLogitsProcessor(LogitsProcessor):
     def validate_params(cls, params: SamplingParams):
         extra = getattr(params, "extra_args", None) or {}
         
-        if not extra.get("kgw_enable", False):
-            return None
-        else:
-            gamma = float(extra.get("kgw_gamma", 0.5))
-            if not (0.0 < gamma < 1.0):
-                raise ValueError("kgw_gamma must be in (0, 1)")
+        kgw_enable =  extra.get("kgw_enable", False)
+        if not isinstance(kgw_enable, bool):
+            raise TypeError("kgw_enable must be a boolean")
+
+        gamma = float(extra.get("kgw_gamma", 0.5))
+        if not (0.0 < gamma < 1.0):
+            raise ValueError("kgw_gamma must be in (0, 1)")
         
-            delta = float(extra.get("kgw_delta", 2.0))
-            if delta < 0:
-                raise ValueError("kgw_delta must be >= 0")
+        delta = float(extra.get("kgw_delta", 2.0))
+        if delta < 0:
+            raise ValueError("kgw_delta must be >= 0")
         
-            window_size = int(extra.get("kgw_window_size", 1))
-            if window_size <= 0:
-                raise ValueError("kgw_window_size must be > 0")
+        window_size = int(extra.get("kgw_window_size", 1))
+        if window_size <= 0:
+            raise ValueError("kgw_window_size must be > 0")
             
-            return dict({
-                "gamma": gamma,
-                "delta": delta,
-                "hash_key": 15485863,
-                "prefix_length": window_size,
-                "f_scheme": "time",
-                "window_scheme": "left"
-            })
+        return dict({
+            "kgw_enable": kgw_enable,
+            "gamma": gamma,
+            "delta": delta,
+            "hash_key": 15485863,
+            "prefix_length": window_size,
+            "f_scheme": "time",
+            "window_scheme": "left"
+        })
         
         
 
@@ -95,10 +97,7 @@ class KGWLogitsProcessor(LogitsProcessor):
         for index, params, prompt_ids, output_ids in batch_update.added:
             assert params is not None
             kgw_params = self.validate_params(params)
-            if kgw_params is not None:
-                self.req_info[index] = kgw_params | {"output_ids_in_window": output_ids} | {"prompt_ids": prompt_ids}
-            else: 
-                self.req_info.pop(index, None)
+            self.req_info[index] = kgw_params | {"output_ids_in_window": output_ids} | {"prompt_ids": prompt_ids}
 
         if self.req_info:
             # Process removed requests.
@@ -118,13 +117,18 @@ class KGWLogitsProcessor(LogitsProcessor):
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.req_info:
-            
+            return logits
+        # In practice, we assure that all requests in the batch have the same kgw_enable status
+        if next(iter(self.req_info.values()))["kgw_enable"] is False:
             return logits
 
         batch_size = logits.shape[0]
+        # In practice, we assure that all requests in the batch have the same KGW parameters,
+        # so we can just take the parameters of the first request.
         window_size = next(iter(self.req_info.values()))["prefix_length"]
         gamma = next(iter(self.req_info.values()))["gamma"]
         delta = next(iter(self.req_info.values()))["delta"]
+        hash_key = next(iter(self.req_info.values()))["hash_key"]
 
         mask = torch.ones(batch_size, dtype=torch.long, device=logits.device)
         output_ids_matrix = torch.zeros(
@@ -132,7 +136,6 @@ class KGWLogitsProcessor(LogitsProcessor):
         )
 
         for i in range(batch_size):
-            
             req = self.req_info.get(i)
             if req is None:
                 mask[i] = 0
@@ -143,7 +146,6 @@ class KGWLogitsProcessor(LogitsProcessor):
                 if(len(window_ids) < window_size):
                     return logits
                 window_ids = window_ids[-window_size:]
-                # print(f"当前上下文窗口 {window_ids}")
                 window_ids = torch.as_tensor(
                     window_ids, dtype=torch.long, device=logits.device
                 )
@@ -154,7 +156,7 @@ class KGWLogitsProcessor(LogitsProcessor):
         # Lazily initialize RNG and the PRF permutation once, and reuse them.
         if (not hasattr(self, "rng")) or self.rng is None or getattr(self.rng, "device", None) != logits.device or (not hasattr(self, "prf")) or self.prf is None or self.prf.numel() != vocab_size:
             self.rng = torch.Generator(device=logits.device)
-            self.rng.manual_seed(15485863)
+            self.rng.manual_seed(int(hash_key))
             self.prf = torch.randperm(vocab_size, device=logits.device, generator=self.rng)
         
         batched_greenlist_ids = [None for _ in range(output_ids_matrix.shape[0])]
@@ -167,12 +169,12 @@ class KGWLogitsProcessor(LogitsProcessor):
                 time_result *= output_ids[-1 - i].item()
             num = self.prf[time_result % vocab_size]
         
-            self.rng.manual_seed((15485863 * int(num)) % vocab_size)
+            self.rng.manual_seed((int(hash_key) * int(num)) % vocab_size)
             greenlist_size = int(vocab_size * gamma)
             vocab_permutation = torch.randperm(vocab_size, device=logits.device, generator=self.rng)
             greenlist_ids = vocab_permutation[:greenlist_size]
             batched_greenlist_ids[idx] = greenlist_ids
-            # print(f"seed:{15485863 * int(num)}, num:{int(num)}, vocab_size:{vocab_size}, greenlist_size:{greenlist_size}")
+
 
         green_tokens_mask = torch.zeros_like(logits)
         for idx in range(len(batched_greenlist_ids)):
@@ -180,6 +182,7 @@ class KGWLogitsProcessor(LogitsProcessor):
                 continue
             green_tokens_mask[idx][batched_greenlist_ids[idx]] = 1
         final_mask = green_tokens_mask.bool()
+        
         
         logits[final_mask] = logits[final_mask] + delta
         return logits
