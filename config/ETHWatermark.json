@@ -1,0 +1,10 @@
+{
+    "algorithm_name": "ETHWatermark",
+    "prefix_char_count": 64,
+    "segment_char_count": 16,
+    "bits_per_segment": 1,
+    "signature_byte_length": 65,
+    "top_p": 0.9,
+    "temperature": 0.9,
+    "max_retry_seconds": 300
+}
