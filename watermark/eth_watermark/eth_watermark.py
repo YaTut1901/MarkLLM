@@ -20,6 +20,24 @@ from tqdm import tqdm
 from ..base import BaseWatermark, BaseConfig
 from utils.transformers_config import TransformersConfig
 
+# ``eth_account`` raw ECDSA signatures are 65 bytes (r ‖ s ‖ v) for standard secp256k1.
+ETH_RAW_SIGNATURE_BYTE_LEN = 65
+
+
+def eth_signature_total_bits() -> int:
+    return ETH_RAW_SIGNATURE_BYTE_LEN * 8
+
+
+def eth_signature_total_segments(bits_per_segment: int) -> int:
+    """Segment count for embedding/detecting one Ethereum raw signature."""
+    tb = eth_signature_total_bits()
+    if tb % bits_per_segment != 0:
+        raise ValueError(
+            f'bits_per_segment={bits_per_segment} must divide ETH signature size '
+            f'({tb} bits = {ETH_RAW_SIGNATURE_BYTE_LEN} bytes)'
+        )
+    return tb // bits_per_segment
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -33,10 +51,15 @@ class ETHWatermarkConfig(BaseConfig):
         self.prefix_char_count = self.config_dict['prefix_char_count']
         self.segment_char_count = self.config_dict['segment_char_count']
         self.bits_per_segment = self.config_dict['bits_per_segment']
-        self.signature_byte_length = self.config_dict['signature_byte_length']
+        self.total_signature_segments = eth_signature_total_segments(self.bits_per_segment)
         self.top_p = self.config_dict.get('top_p', 0.9)
         self.temperature = self.config_dict.get('temperature', 0.9)
         self.max_retry_seconds = self.config_dict.get('max_retry_seconds', 300)
+        self.post_signature_max_chars = self.config_dict.get('post_signature_max_chars', None)
+        rp = float(self.config_dict.get('repetition_penalty', 1.0))
+        if rp <= 0:
+            raise ValueError('repetition_penalty must be positive')
+        self.repetition_penalty = rp
 
     @property
     def algorithm_name(self) -> str:
@@ -52,6 +75,21 @@ class ETHWatermarkUtils:
 
     def __init__(self, config: ETHWatermarkConfig) -> None:
         self.config = config
+
+    @staticmethod
+    def token_ends_generation(token_id: int, tokenizer) -> bool:
+        """True if *token_id* is an EOS / end-of-turn id for this tokenizer."""
+        eos = getattr(tokenizer, "eos_token_id", None)
+        if eos is not None:
+            if isinstance(eos, (list, tuple)):
+                if token_id in eos:
+                    return True
+            elif token_id == eos:
+                return True
+        eot = getattr(tokenizer, "eot_id", None)
+        if eot is not None and token_id == eot:
+            return True
+        return False
 
     # -- Crypto helpers -----------------------------------------------------
 
@@ -126,6 +164,30 @@ class ETHWatermarkUtils:
         assert bit_count <= 256
         return BitArray(bytes=hashlib.sha256(input_bytes).digest()).bin[:bit_count]
 
+    @staticmethod
+    def apply_repetition_penalty(
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        penalty: float,
+        vocab_size: int,
+    ) -> None:
+        """Downweight logits for tokens in *input_ids* (HuggingFace-style). Mutates *logits*.
+
+        For each prior token id, if logit > 0 divide by *penalty*, else multiply.
+        Applied once per occurrence (same as ``RepetitionPenaltyLogitsProcessor``).
+        """
+        if penalty == 1.0:
+            return
+        for batch_idx in range(logits.shape[0]):
+            for tid in input_ids[batch_idx]:
+                t = int(tid.item())
+                if t < 0 or t >= vocab_size:
+                    continue
+                score = logits[batch_idx, t]
+                logits[batch_idx, t] = torch.where(
+                    score < 0, score * penalty, score / penalty
+                )
+
     # -- Token sampling with KV cache --------------------------------------
 
     def sample_one_token(
@@ -136,54 +198,67 @@ class ETHWatermarkUtils:
         kv_cache,
         attention_mask: torch.Tensor,
         vocab_size: int,
+        allow_stop_token: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, object, torch.Tensor]:
         """Sample a single token using nucleus (top-p) sampling.
 
         Uses the KV cache so only the last token is fed on subsequent calls.
         Returns (token_tensor, updated_input_ids, updated_kv_cache, updated_attention_mask).
         """
-        with torch.no_grad():
-            if kv_cache is not None:
-                output = model(
-                    input_ids[:, -1:],
-                    past_key_values=kv_cache,
-                    attention_mask=attention_mask,
+        deadline = time.time() + self.config.max_retry_seconds
+
+        while True:
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"sample_one_token: exceeded {self.config.max_retry_seconds}s "
+                    "(e.g. EOS resampling during prefix or segment)"
                 )
-            else:
-                output = model(input_ids)
 
-        logits = output.logits[:, -1, :vocab_size]
+            with torch.no_grad():
+                if kv_cache is not None:
+                    output = model(
+                        input_ids[:, -1:],
+                        past_key_values=kv_cache,
+                        attention_mask=attention_mask,
+                    )
+                else:
+                    output = model(input_ids)
 
-        # --- Nucleus sampling ---
-        temperature = self.config.temperature
-        top_p = self.config.top_p
+            logits = output.logits[:, -1, :vocab_size].clone()
+            self.apply_repetition_penalty(
+                logits, input_ids, self.config.repetition_penalty, vocab_size,
+            )
 
-        scaled_logits = logits / temperature
-        sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            # --- Nucleus sampling ---
+            temperature = self.config.temperature
+            top_p = self.config.top_p
 
-        # Remove tokens whose cumulative probability exceeds top_p,
-        # but always keep the most probable token.
-        indices_to_remove = cumulative_probs > top_p
-        indices_to_remove[..., 1:] = indices_to_remove[..., :-1].clone()
-        indices_to_remove[..., 0] = False
+            scaled_logits = logits / temperature
+            sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
 
-        remove_mask = sorted_indices[indices_to_remove]
-        logits[..., remove_mask] = float("-inf")
+            # Remove tokens whose cumulative probability exceeds top_p,
+            # but always keep the most probable token.
+            indices_to_remove = cumulative_probs > top_p
+            indices_to_remove[..., 1:] = indices_to_remove[..., :-1].clone()
+            indices_to_remove[..., 0] = False
 
-        probs = torch.softmax(logits, dim=-1)
-        token = torch.multinomial(probs, num_samples=1)
+            remove_mask = sorted_indices[indices_to_remove]
+            logits[..., remove_mask] = float("-inf")
 
-        # Append the sampled token to the running sequence
-        token = token.view(1, 1)
-        input_ids = torch.cat([input_ids, token], dim=-1)
-        kv_cache = output.past_key_values
-        attention_mask = torch.cat(
-            [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
-            dim=-1,
-        )
+            probs = torch.softmax(logits, dim=-1)
+            token = torch.multinomial(probs, num_samples=1).view(1, 1)
+            new_input_ids = torch.cat([input_ids, token], dim=-1)
+            tid = int(token.view(-1)[0].item())
 
-        return token, input_ids, kv_cache, attention_mask
+            if not allow_stop_token and self.token_ends_generation(tid, tokenizer):
+                continue
+
+            attention_mask = torch.cat(
+                [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))],
+                dim=-1,
+            )
+            return token, new_input_ids, output.past_key_values, attention_mask
 
     @staticmethod
     def decode_new_token(
@@ -211,13 +286,12 @@ class ETHWatermarkUtils:
         kv_cache,
         attention_mask: torch.Tensor,
         vocab_size: int,
+        allow_stop_token: bool,
     ) -> tuple[str, str, torch.Tensor, object, torch.Tensor]:
-        """Generate exactly *char_count* characters of text.
+        """Grow text up to *char_count* characters (may stop early on EOS).
 
-        Any characters beyond the required count are returned as *overflow*
-        so the next segment can start from them (preserving token boundaries).
-
-        Returns (segment_text, overflow_text, input_ids, kv_cache, attention_mask).
+        When ``allow_stop_token`` is True and the sampled token is EOS, stop
+        sampling. Overflow past *char_count* is returned for the next segment boundary.
         """
         segment_text = initial_overflow
         overflow_text = ""
@@ -226,8 +300,18 @@ class ETHWatermarkUtils:
             prev_input_ids = input_ids
 
             token, input_ids, kv_cache, attention_mask = self.sample_one_token(
-                model, tokenizer, input_ids, kv_cache, attention_mask, vocab_size,
+                model,
+                tokenizer,
+                input_ids,
+                kv_cache,
+                attention_mask,
+                vocab_size,
+                allow_stop_token,
             )
+
+            tid = int(token.view(-1)[0].item())
+            if allow_stop_token and self.token_ends_generation(tid, tokenizer):
+                break
 
             token_chars = self.decode_new_token(prev_input_ids, input_ids, tokenizer)
             segment_text += token_chars
@@ -238,6 +322,53 @@ class ETHWatermarkUtils:
                 segment_text = segment_text[:char_count]
 
         return segment_text, overflow_text, input_ids, kv_cache, attention_mask
+
+    def sample_until_eos(
+        self,
+        initial_overflow: str,
+        model,
+        tokenizer,
+        input_ids: torch.Tensor,
+        kv_cache,
+        attention_mask: torch.Tensor,
+        vocab_size: int,
+        max_chars: int | None = None,
+    ) -> tuple[str, torch.Tensor, object, torch.Tensor]:
+        """Append tokens until EOS, or until *max_chars* UTF-8 characters (if set).
+
+        After signature embedding, ``max_chars`` caps the tail length (including
+        ``initial_overflow``). If ``max_chars`` is None, runs until EOS only.
+        Uses ``max_retry_seconds`` as a wall-clock bound if EOS is never sampled
+        and no character cap applies.
+        """
+        out = initial_overflow
+        deadline = time.time() + self.config.max_retry_seconds
+
+        while True:
+            if max_chars is not None and len(out) >= max_chars:
+                break
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    f"sample_until_eos: no EOS within {self.config.max_retry_seconds}s"
+                )
+
+            prev_input_ids = input_ids
+            token, input_ids, kv_cache, attention_mask = self.sample_one_token(
+                model,
+                tokenizer,
+                input_ids,
+                kv_cache,
+                attention_mask,
+                vocab_size,
+                allow_stop_token=True,
+            )
+            tid = int(token.view(-1)[0].item())
+            if self.token_ends_generation(tid, tokenizer):
+                break
+            token_chars = self.decode_new_token(prev_input_ids, input_ids, tokenizer)
+            out += token_chars
+
+        return out, input_ids, kv_cache, attention_mask
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +384,6 @@ class ETHWatermark(BaseWatermark):
         3. XOR-mask the signature with SHA-512(prefix_hash) (Fairoze OTP; extended
            to 65 bytes for ECDSA length).
         4. Embed the masked 520-bit string into subsequent text via a hash chain.
-
     Detection:
         Rebuild masked bits, unmask with the same OTP, recover the ETH address.
     """
@@ -295,11 +425,7 @@ class ETHWatermark(BaseWatermark):
         prefix_char_count = self.config.prefix_char_count
         segment_char_count = self.config.segment_char_count
         bits_per_segment = self.config.bits_per_segment
-        signature_byte_length = self.config.signature_byte_length
         max_retry_seconds = self.config.max_retry_seconds
-
-        total_signature_bits = signature_byte_length * 8
-        total_segments = total_signature_bits // bits_per_segment
 
         # Encode the prompt and initialise the KV-cache state
         input_ids = tokenizer.encode(
@@ -308,16 +434,30 @@ class ETHWatermark(BaseWatermark):
         attention_mask = torch.ones_like(input_ids)
         kv_cache = None
 
-        # -- Step 1: generate the prefix (unwatermarked LM text) ------------
+        # -- Step 1: generate the prefix - unwatermarked text (reject EOS until prefix is done)
         prefix_text, segment_overflow, input_ids, kv_cache, attention_mask = (
             self.utils.sample_n_characters(
-                prefix_char_count, "", model, tokenizer,
-                input_ids, kv_cache, attention_mask, vocab_size,
+                prefix_char_count,
+                "",
+                model,
+                tokenizer,
+                input_ids,
+                kv_cache,
+                attention_mask,
+                vocab_size,
+                allow_stop_token=False,
             )
         )
 
         # -- Step 2: sign the prefix and OTP-mask (Fairoze-style) ------------
         signature_bytes = self.utils.eth_sign_prefix(prefix_text, private_key)
+        if len(signature_bytes) != ETH_RAW_SIGNATURE_BYTE_LEN:
+            raise ValueError(
+                f'Expected {ETH_RAW_SIGNATURE_BYTE_LEN}-byte Ethereum raw signature, '
+                f'got {len(signature_bytes)} bytes'
+            )
+        total_segments = self.config.total_signature_segments
+
         message_for_otp = self.utils.prefix_hash_bytes(prefix_text)
         signature_bits = self.utils.mask_signature_with_otp(
             signature_bytes, message_for_otp,
@@ -354,11 +494,18 @@ class ETHWatermark(BaseWatermark):
                 kv_cache = saved_kv_cache
                 attention_mask = saved_attention_mask
 
-                # Generate one segment of text
+                # Generate one segment (no stop token until all segments are done)
                 segment_text, next_overflow, input_ids, kv_cache, attention_mask = (
                     self.utils.sample_n_characters(
-                        segment_char_count, saved_overflow, model, tokenizer,
-                        input_ids, kv_cache, attention_mask, vocab_size,
+                        segment_char_count,
+                        saved_overflow,
+                        model,
+                        tokenizer,
+                        input_ids,
+                        kv_cache,
+                        attention_mask,
+                        vocab_size,
+                        allow_stop_token=False,
                     )
                 )
 
@@ -380,7 +527,53 @@ class ETHWatermark(BaseWatermark):
             watermarked_text += segment_text
             segment_overflow = next_overflow
 
+        tail_text, input_ids, kv_cache, attention_mask = self.utils.sample_until_eos(
+            segment_overflow,
+            model,
+            tokenizer,
+            input_ids,
+            kv_cache,
+            attention_mask,
+            vocab_size,
+            max_chars=self.config.post_signature_max_chars,
+        )
+        watermarked_text += tail_text
+
         return watermarked_text
+
+    def _try_recover_at_segments(
+        self,
+        prefix_text: str,
+        signature_region: str,
+        segment_char_count: int,
+        bits_per_segment: int,
+        total_segments: int,
+    ) -> str | None:
+        """Rebuild hash chain for *total_segments* segments; return address or None."""
+        accumulated_hash_bits = ""
+        for seg_idx in range(total_segments):
+            seg_start = seg_idx * segment_char_count
+            segment_text = signature_region[seg_start : seg_start + segment_char_count]
+            if len(segment_text) < segment_char_count:
+                return None
+            hash_input = (
+                prefix_text.encode('utf-8')
+                + accumulated_hash_bits.encode('utf-8')
+                + segment_text.encode('utf-8')
+            )
+            computed_hash_bits = self.utils.unkeyed_hash_to_bits(
+                hash_input, bits_per_segment,
+            )
+            accumulated_hash_bits += computed_hash_bits
+
+        try:
+            message_for_otp = self.utils.prefix_hash_bytes(prefix_text)
+            recovered_signature = self.utils.unmask_signature_bits(
+                accumulated_hash_bits, message_for_otp,
+            )
+            return self.utils.eth_recover_address(prefix_text, recovered_signature)
+        except Exception:
+            return None
 
     # ----- detection -------------------------------------------------------
 
@@ -395,11 +588,8 @@ class ETHWatermark(BaseWatermark):
         prefix_char_count = self.config.prefix_char_count
         segment_char_count = self.config.segment_char_count
         bits_per_segment = self.config.bits_per_segment
-        signature_byte_length = self.config.signature_byte_length
-        total_signature_bits = signature_byte_length * 8
-        total_segments = total_signature_bits // bits_per_segment
+        total_segments = self.config.total_signature_segments
 
-        # Minimum text length: prefix + enough characters for all segments
         min_length = prefix_char_count + segment_char_count * total_segments
         if len(text) < min_length:
             if return_dict:
@@ -416,47 +606,20 @@ class ETHWatermark(BaseWatermark):
             prefix_text = rotated_text[:prefix_char_count]
             signature_region = rotated_text[prefix_char_count:]
 
-            # Walk fixed-size segments and rebuild the hash chain
-            accumulated_hash_bits = ""
-            segment_count = 0
-
-            for seg_start in range(0, len(signature_region), segment_char_count):
-                if segment_count >= total_segments:
-                    break
-
-                segment_text = signature_region[seg_start : seg_start + segment_char_count]
-                if len(segment_text) < segment_char_count:
-                    break
-
-                hash_input = (
-                    prefix_text.encode("utf-8")
-                    + accumulated_hash_bits.encode("utf-8")
-                    + segment_text.encode("utf-8")
-                )
-                computed_hash_bits = self.utils.unkeyed_hash_to_bits(
-                    hash_input, bits_per_segment,
-                )
-                accumulated_hash_bits += computed_hash_bits
-                segment_count += 1
-
-            if segment_count < total_segments:
-                continue
-
-            # Unmask OTP then recover signature bytes and signer address
-            try:
-                message_for_otp = self.utils.prefix_hash_bytes(prefix_text)
-                recovered_signature = self.utils.unmask_signature_bits(
-                    accumulated_hash_bits, message_for_otp,
-                )
-                recovered_address = self.utils.eth_recover_address(
-                    prefix_text, recovered_signature,
-                )
-            except Exception:
-                continue
-
-            if return_dict:
-                return {"is_watermarked": True, "recovered_address": recovered_address}
-            return (True, recovered_address)
+            recovered_address = self._try_recover_at_segments(
+                prefix_text,
+                signature_region,
+                segment_char_count,
+                bits_per_segment,
+                total_segments,
+            )
+            if recovered_address is not None:
+                if return_dict:
+                    return {
+                        "is_watermarked": True,
+                        "recovered_address": recovered_address,
+                    }
+                return (True, recovered_address)
 
         if return_dict:
             return {"is_watermarked": False, "recovered_address": None}
