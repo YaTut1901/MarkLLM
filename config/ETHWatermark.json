@@ -1,8 +1,10 @@
 {
     "algorithm_name": "ETHWatermark",
+    "private_key": "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
     "prefix_char_count": 64,
     "segment_char_count": 16,
     "bits_per_segment": 2,
+    "max_planted_errors": 16,
     "top_p": 0.85,
     "temperature": 0.7,
     "max_retry_seconds": 300,

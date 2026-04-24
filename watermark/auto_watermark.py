@@ -46,7 +46,8 @@ WATERMARK_MAPPING_NAMES = {
     "KSEMSTAMP": 'watermark.k_semstamp.KSemStamp',
     "SEMSTAMP": 'watermark.semstamp.SemStamp',
     "IE": "watermark.ie.IE",
-    "ETHWatermark": "watermark.eth_watermark.ETHWatermark"
+    "ETHWatermark": "watermark.eth_watermark.ETHWatermark",
+    "STEAL": "watermark.steal.STEAL",
 }
 
 
