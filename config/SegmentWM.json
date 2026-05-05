@@ -1,0 +1,14 @@
+{
+  "algorithm_name": "SegmentWM",
+  "segments_num": 64,
+  "gf_segments_num": 100,
+  "segment_bit": 8,
+  "gamma": 0.25,
+  "delta": 8.0,
+  "ngram": 3,
+  "seed": 42,
+  "salt_key": 35317,
+  "seeding": "hash",
+  "payload": 0,
+  "z_threshold": 20.0
+}
