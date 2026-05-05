@@ -48,6 +48,7 @@ WATERMARK_MAPPING_NAMES = {
     "IE": "watermark.ie.IE",
     "ETHWatermark": "watermark.eth_watermark.ETHWatermark",
     "STEAL": "watermark.steal.STEAL",
+    "SegmentWM": "watermark.segment_wm.SegmentWM",
 }
 
 

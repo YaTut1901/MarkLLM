@@ -35,7 +35,7 @@ def assess_detectability(algorithm_name, labels, rules, target_fpr):
                                              tokenizer=AutoTokenizer.from_pretrained("/data2/shared_model/facebook/opt-1.3b/"),
                                              vocab_size=50272,
                                              device=device,
-                                             max_new_tokens=200,
+                                             max_new_tokens=700,
                                              min_length=230,
                                              do_sample=True,
                                              no_repeat_ngram_size=4)

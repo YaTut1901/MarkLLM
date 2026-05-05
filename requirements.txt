@@ -5,6 +5,7 @@ jieba
 accelerate
 tqdm
 SentencePiece
+protobuf>=4.21.0
 openai==0.28
 matplotlib
 Cython
@@ -17,3 +18,4 @@ tiktoken
 eth-account>=0.10.0
 reedsolo
 bitstring
+galois

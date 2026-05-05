@@ -17,7 +17,7 @@
 # Description: Calculate success rate of watermark detection
 # ==========================================================
 
-from typing import List, Dict, Union
+from typing import Dict, List, Optional, Tuple, Union
 from exceptions.exceptions import TypeMismatchException, ConfigurationError
 
 
@@ -191,8 +191,10 @@ class DynamicThresholdSuccessRateCalculator(BaseSuccessRateCalculator):
             # If the rule is to find the threshold that achieves the target FPR
             return self._find_threshold_by_fpr(sorted_inputs)
 
-    def _compute_metrics(self, inputs: List[DetectionResult], threshold: float) -> Dict[str, float]:
-        """Compute metrics based on the provided inputs and threshold."""
+    def _confusion_at_threshold(
+        self, inputs: List[DetectionResult], threshold: float,
+    ) -> Tuple[int, int, int, int]:
+        """Return TP, TN, FP, FN for ``inputs`` at ``threshold``."""
         if not self.reverse:
             TP = sum(1 for x in inputs if x.detect_result >= threshold and x.gold_label)
             FP = sum(1 for x in inputs if x.detect_result >= threshold and not x.gold_label)
@@ -203,6 +205,11 @@ class DynamicThresholdSuccessRateCalculator(BaseSuccessRateCalculator):
             FP = sum(1 for x in inputs if x.detect_result <= threshold and not x.gold_label)
             TN = sum(1 for x in inputs if x.detect_result > threshold and not x.gold_label)
             FN = sum(1 for x in inputs if x.detect_result > threshold and x.gold_label)
+        return TP, TN, FP, FN
+
+    def _compute_metrics(self, inputs: List[DetectionResult], threshold: float) -> Dict[str, float]:
+        """Compute metrics based on the provided inputs and threshold."""
+        TP, TN, FP, FN = self._confusion_at_threshold(inputs, threshold)
 
         metrics = {
             'TPR': TP / (TP + FN) if TP + FN else 0,
@@ -216,11 +223,69 @@ class DynamicThresholdSuccessRateCalculator(BaseSuccessRateCalculator):
         }
         return metrics
 
-    def calculate(self, watermarked_result: List[float], non_watermarked_result: List[float]) -> Dict[str, float]:
-        """Calculate success rates based on provided results."""
+    def calculate_detailed(
+        self,
+        watermarked_result: List[float],
+        non_watermarked_result: List[float],
+    ) -> Dict[str, Union[float, Dict[str, object]]]:
+        """
+        Same threshold rule as ``calculate``, plus optimal threshold and per-subset rows.
+
+        ``subset_metrics['unwatermarked']``: rates among gold-unwatermarked samples (TNR, FPR);
+        ``subset_metrics['watermarked']``: among gold-watermarked samples (TPR, FNR).
+        Inapplicable cells are ``None``. ``F1`` is the overall F1 at the chosen threshold on both
+        classes; ``ACC`` per row is accuracy restricted to that row's gold class (equals TNR / TPR).
+        """
         self._check_instance(watermarked_result + non_watermarked_result, float)
 
-        inputs = [DetectionResult(True, x) for x in watermarked_result] + [DetectionResult(False, x) for x in non_watermarked_result]
-        threshold = self._find_threshold(inputs)
-        metrics = self._compute_metrics(inputs, threshold)
-        return self._filter_metrics(metrics)
+        inputs = (
+            [DetectionResult(True, x) for x in watermarked_result]
+            + [DetectionResult(False, x) for x in non_watermarked_result]
+        )
+        threshold = float(self._find_threshold(inputs))
+        full_metrics = self._compute_metrics(inputs, threshold)
+        metrics = self._filter_metrics(full_metrics)
+
+        TP, TN, FP, FN = self._confusion_at_threshold(inputs, threshold)
+        neg_n = TN + FP
+        pos_n = TP + FN
+
+        f1 = float(metrics["F1"]) if "F1" in metrics else float(full_metrics["F1"])
+
+        def row(
+            tpr: Optional[float], tnr: Optional[float], fpr: Optional[float],
+            fnr: Optional[float], acc: Optional[float],
+        ) -> Dict[str, Optional[float]]:
+            out: Dict[str, Optional[float]] = {
+                "TPR": tpr, "TNR": tnr, "FPR": fpr, "FNR": fnr, "F1": f1, "ACC": acc,
+            }
+            return {k: out[k] for k in self.labels if k in out}
+
+        subset_un = row(
+            None,
+            TN / neg_n if neg_n else 0.0,
+            FP / neg_n if neg_n else 0.0,
+            None,
+            TN / neg_n if neg_n else 0.0,
+        )
+        subset_wm = row(
+            TP / pos_n if pos_n else 0.0,
+            None,
+            None,
+            FN / pos_n if pos_n else 0.0,
+            TP / pos_n if pos_n else 0.0,
+        )
+
+        return {
+            "threshold": threshold,
+            "metrics": metrics,
+            "subset_metrics": {
+                "unwatermarked": subset_un,
+                "watermarked": subset_wm,
+            },
+        }
+
+    def calculate(self, watermarked_result: List[float], non_watermarked_result: List[float]) -> Dict[str, float]:
+        """Calculate success rates based on provided results."""
+        detailed = self.calculate_detailed(watermarked_result, non_watermarked_result)
+        return detailed["metrics"]  # type: ignore[return-value]

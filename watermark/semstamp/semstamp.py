@@ -219,7 +219,8 @@ class SemStamp(BaseWatermark):
         maxedout_trials = 0
         while True:
             stopping_criteria = StoppingCriteriaList([sent_end_criteria])
-            if "opt" in self.config.generation_model.config._name_or_path:
+            _model_id = self.config.generation_model.config._name_or_path.lower()
+            if "opt" in _model_id or "qwen" in _model_id:
                 num_candidates = 8
                 outputs = self.config.generation_model.generate(text_ids,
                                                                 max_new_tokens=self.config.max_new_tokens,

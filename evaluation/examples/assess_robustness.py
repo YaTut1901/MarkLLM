@@ -17,18 +17,39 @@
 # Description: Assess the robustness of a watermarking algorithm
 # ================================================================
 
+import os
+
 import torch
 from translate import Translator
 from evaluation.dataset import C4Dataset
 from watermark.auto_watermark import AutoWatermark
 from utils.transformers_config import TransformersConfig
 from evaluation.tools.success_rate_calculator import DynamicThresholdSuccessRateCalculator
-from transformers import AutoModelForCausalLM, AutoTokenizer, T5Tokenizer, T5ForConditionalGeneration, BertTokenizer, BertForMaskedLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSeq2SeqLM, BertTokenizer, BertForMaskedLM
 from evaluation.pipelines.detection import WatermarkedTextDetectionPipeline, UnWatermarkedTextDetectionPipeline, DetectionPipelineReturnType
-from evaluation.tools.text_editor import TruncatePromptTextEditor, WordDeletion, SynonymSubstitution, ContextAwareSynonymSubstitution, GPTParaphraser, DipperParaphraser, BackTranslationTextEditor
+from evaluation.tools.text_editor import TruncatePromptTextEditor, WordDeletion, SynonymSubstitution, ContextAwareSynonymSubstitution, GPTParaphraser, ParrotT5Paraphraser, BackTranslationTextEditor
 
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+PARROT_T5_REPO = "prithivida/parrot_paraphraser_on_T5"
+
+
+def _default_parrot_attack():
+    os.environ.setdefault("DISABLE_SAFETENSORS_CONVERSION", "1")
+    tokenizer = AutoTokenizer.from_pretrained(PARROT_T5_REPO)
+    dt = torch.float16 if device == "cuda" and torch.cuda.is_available() else torch.float32
+    m = AutoModelForSeq2SeqLM.from_pretrained(PARROT_T5_REPO, torch_dtype=dt).to(device).eval()
+    return ParrotT5Paraphraser(
+        tokenizer=tokenizer,
+        model=m,
+        device=device,
+        sent_interval=1,
+        max_length=64,
+        num_beams=5,
+        num_return_sequences=1,
+        do_sample=False,
+    )
 
 def assess_robustness(algorithm_name, attack_name):
     my_dataset = C4Dataset('dataset/c4/processed_c4.json')
@@ -36,7 +57,7 @@ def assess_robustness(algorithm_name, attack_name):
                                              tokenizer=AutoTokenizer.from_pretrained("/data2/shared_model/facebook/opt-1.3b/"),
                                              vocab_size=50272,
                                              device=device,
-                                             max_new_tokens=200,
+                                             max_new_tokens=700,
                                              min_length=230,
                                              do_sample=True,
                                              no_repeat_ngram_size=4)
@@ -54,11 +75,8 @@ def assess_robustness(algorithm_name, attack_name):
     elif attack_name == 'Doc-P(GPT-3.5)':
         attack = GPTParaphraser(openai_model='gpt-3.5-turbo',
                                 prompt='Please rewrite the following text: ')
-    elif attack_name == 'Doc-P(Dipper)':
-        attack = DipperParaphraser(tokenizer=T5Tokenizer.from_pretrained('/data2/shared_model/google/t5-v1_1-xxl/'),
-                                   model=T5ForConditionalGeneration.from_pretrained('/data2/shared_model/kalpeshk2011/dipper-paraphraser-xxl/', device_map='auto'),
-                                   lex_diversity=60, order_diversity=0, sent_interval=1, 
-                                   max_new_tokens=100, do_sample=True, top_p=0.75, top_k=None)
+    elif attack_name == "Doc-P(Parrot)":
+        attack = _default_parrot_attack()
     elif attack_name == 'Translation':
         attack = BackTranslationTextEditor(translate_to_intermediary = Translator(from_lang="en", to_lang="zh").translate,
                                            translate_to_source = Translator(from_lang="zh", to_lang="en").translate)

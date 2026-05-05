@@ -30,9 +30,15 @@ from translate import Translator
 from nltk.tokenize import word_tokenize
 from nltk.tokenize import sent_tokenize
 from utils.openai_utils import OpenAIAPI
-from exceptions.exceptions import DiversityValueError
 from evaluation.tools.oracle import QualityOracle
-from transformers import T5Tokenizer, T5ForConditionalGeneration, BertTokenizer, BertForMaskedLM
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    T5Tokenizer,
+    T5ForConditionalGeneration,
+    BertTokenizer,
+    BertForMaskedLM,
+)
 
 class TextEditor:
     """Base class for text editing."""
@@ -220,80 +226,57 @@ class GPTParaphraser(TextEditor):
         return paraphrased_text
 
 
-class DipperParaphraser(TextEditor):
-    """Paraphrase a text using the DIPPER model."""
+class ParrotT5Paraphraser(TextEditor):
+    """Paraphrase text with the Parrot T5 checkpoint (e.g. prithivida/parrot_paraphraser_on_T5)."""
 
-    def __init__(self, tokenizer: T5Tokenizer, model: T5ForConditionalGeneration, device='cuda',
-                 lex_diversity: int = 60, order_diversity: int = 0, sent_interval: int = 1, **kwargs):
-        """
-            Paraphrase a text using the DIPPER model.
-
-            Parameters:
-                tokenizer (T5Tokenizer): The tokenizer for the DIPPER model.
-                model (T5ForConditionalGeneration): The DIPPER model.
-                device (str): The device to use for inference.
-                lex_diversity (int): The lexical diversity of the output, choose multiples of 20 from 0 to 100. 0 means no diversity, 100 means maximum diversity.
-                order_diversity (int): The order diversity of the output, choose multiples of 20 from 0 to 100. 0 means no diversity, 100 means maximum diversity.
-                sent_interval (int): The number of sentences to process at a time.
-        """
+    def __init__(
+        self,
+        tokenizer,
+        model,
+        device: str = "cuda",
+        sent_interval: int = 1,
+        **kwargs,
+    ) -> None:
         self.tokenizer = tokenizer
         self.model = model.eval()
         self.device = device
-        self.lex_diversity = lex_diversity
-        self.order_diversity = order_diversity
         self.sent_interval = sent_interval
-        self.gen_kwargs = {}
+        self.gen_kwargs: dict = {}
         self.gen_kwargs.update(kwargs)
 
-        # Validate diversity settings
-        self._validate_diversity(self.lex_diversity, "Lexical")
-        self._validate_diversity(self.order_diversity, "Order")
-    
-    def _validate_diversity(self, value: int, type_name: str):
-        """Validate the diversity value."""
-        if value not in [0, 20, 40, 60, 80, 100]:
-            raise DiversityValueError(type_name)
+    def _tensor_device(self):
+        t = self.device
+        if isinstance(t, str) and t == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        return t
 
-    def edit(self, text: str, reference: str):
-        """Edit the text using the DIPPER model."""
-
-        # Calculate the lexical and order diversity codes
-        lex_code = int(100 - self.lex_diversity)
-        order_code = int(100 - self.order_diversity)
-        
-        # Preprocess the input text
-        text = " ".join(text.split())
+    def edit(self, text: str, reference=None):
+        """Paraphrase each sentence window; ``reference`` is ignored (Parrot is not prompt-conditioned)."""
+        text = " ".join((text or "").split())
+        if not text.strip():
+            return text
         sentences = sent_tokenize(text)
-        
-        # Preprocess the reference text
-        prefix = " ".join(reference.replace("\n", " ").split())
-        
-        output_text = ""
-        
-        # Process the input text in sentence windows
-        for sent_idx in range(0, len(sentences), self.sent_interval):
-            curr_sent_window = " ".join(sentences[sent_idx:sent_idx + self.sent_interval])
-            
-            # Prepare the input for the model
-            final_input_text = f"lexical = {lex_code}, order = {order_code}"
-            if prefix:
-                final_input_text += f" {prefix}"
-            final_input_text += f" <sent> {curr_sent_window} </sent>"
-            
-            # Tokenize the input
-            final_input = self.tokenizer([final_input_text], return_tensors="pt")
-            final_input = {k: v.cuda() for k, v in final_input.items()}
-            
-            # Generate the edited text
-            with torch.inference_mode():
-                outputs = self.model.generate(**final_input, **self.gen_kwargs)
-            outputs = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            
-            # Update the prefix and output text
-            prefix += " " + outputs[0]
-            output_text += " " + outputs[0]
+        if not sentences:
+            return text
 
-        return output_text
+        target = self._tensor_device()
+        parts: list[str] = []
+        for sent_idx in range(0, len(sentences), self.sent_interval):
+            window = " ".join(sentences[sent_idx : sent_idx + self.sent_interval]).strip()
+            if not window:
+                continue
+            enc = self.tokenizer(
+                window,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+            enc = {k: v.to(target) for k, v in enc.items()}
+            with torch.inference_mode():
+                out_ids = self.model.generate(**enc, **self.gen_kwargs)
+            dec = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)[0].strip()
+            parts.append(dec if dec else window)
+        return " ".join(parts)
 
 
 class WordDeletion(TextEditor):
@@ -403,40 +386,87 @@ class ContextAwareSynonymSubstitution(TextEditor):
                 synonyms.add(lemma.name().replace('_', ' '))
         return list(synonyms)
 
+    def _bert_predict_masked_word(self, words: list[str], i: int) -> str | None:
+        """
+        Run MLM on a local window around index i so [MASK] is not truncated away
+        (full-sequence encode fails for long LM outputs vs BERT's max length).
+        """
+        mask_tok = self.tokenizer.mask_token
+        max_length = getattr(self.tokenizer, "model_max_length", None) or 512
+        if max_length <= 2:
+            max_length = 512
+        max_length = int(max_length)
+        n = len(words)
+
+        radii_words = [16, 32, 64, 128, 256, 512, 1024, n]
+        prev_radii = []
+        last_inputs = None
+        last_mask_pos = None
+
+        for radius in radii_words:
+            if radius in prev_radii:
+                continue
+            prev_radii.append(radius)
+            lo = max(0, i - radius)
+            hi = min(n, i + radius + 1)
+            masked_words = words[lo:i] + [mask_tok] + words[i + 1 : hi]
+            masked_text = " ".join(masked_words)
+            inputs = self.tokenizer(
+                masked_text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+            )
+            ids = inputs["input_ids"][0]
+            mask_where = torch.where(ids == self.tokenizer.mask_token_id)[0]
+            if mask_where.numel() != 1:
+                continue
+            mask_position = mask_where.item()
+            last_inputs = inputs
+            last_mask_pos = mask_position
+
+        if last_inputs is None or last_mask_pos is None:
+            return None
+
+        inputs = last_inputs.to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        predictions = outputs.logits[0, last_mask_pos]
+        predicted_indices = torch.argsort(predictions, descending=True)
+        predicted_tokens = self.tokenizer.convert_ids_to_tokens(predicted_indices[:1])
+        return predicted_tokens[0] if predicted_tokens else None
+
     def edit(self, text: str, reference=None):
         """Randomly replace words with synonyms from WordNet based on the context."""
         words = text.split()
         num_words = len(words)
+        if num_words == 0:
+            return text
+
         replaceable_indices = []
 
-        for i, word in enumerate(words):
+        for idx, word in enumerate(words):
             if self._get_synonyms_from_wordnet(word):
-                replaceable_indices.append(i)
+                replaceable_indices.append(idx)
 
-        num_to_replace = int(min(self.ratio, len(replaceable_indices) / num_words) * num_words)
+        if not replaceable_indices:
+            return text
+
+        num_to_replace = int(
+            min(self.ratio, len(replaceable_indices) / num_words) * num_words
+        )
         indices_to_replace = random.sample(replaceable_indices, num_to_replace)
 
         real_replace = 0
 
-        for i in indices_to_replace:
-            # Create a sentence with a [MASK] token
-            masked_sentence = words[:i] + ['[MASK]'] + words[i+1:]
-            masked_text = " ".join(masked_sentence)
-            
-            # Use BERT to predict the token for [MASK]
-            inputs = self.tokenizer(masked_text, return_tensors='pt', padding=True, truncation=True).to(self.device)
-            mask_position = torch.where(inputs["input_ids"][0] == self.tokenizer.mask_token_id)[0].item()
+        for idx in indices_to_replace:
+            predicted_token = self._bert_predict_masked_word(words, idx)
+            if predicted_token is not None:
+                words[idx] = predicted_token
+                real_replace += 1
 
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-
-            predictions = outputs.logits[0, mask_position]
-            predicted_indices = torch.argsort(predictions, descending=True)
-            predicted_tokens = self.tokenizer.convert_ids_to_tokens(predicted_indices[0:1])
-            words[i] = predicted_tokens[0]
-            real_replace += 1
-        
-        replaced_text = ' '.join(words)
+        replaced_text = " ".join(words)
 
         return replaced_text
 
@@ -505,3 +535,117 @@ class BackTranslationTextEditor(TextEditor):
         intermediary_text = self.translate_to_intermediary(text)
         edit_result = self.translate_to_source(intermediary_text)
         return edit_result
+
+
+def _nllb_forced_bos_token_id(tokenizer, lang_code: str) -> int:
+    if hasattr(tokenizer, "lang_code_to_id") and lang_code in tokenizer.lang_code_to_id:
+        return int(tokenizer.lang_code_to_id[lang_code])
+    tid = tokenizer.convert_tokens_to_ids(lang_code)
+    if tokenizer.unk_token_id is not None and tid == tokenizer.unk_token_id:
+        raise ValueError(
+            f"Unknown NLLB language code {lang_code!r}. "
+            "Use FLORES codes (e.g. eng_Latn, zho_Hans).",
+        )
+    return int(tid)
+
+
+class LocalNLLBBackTranslationEditor(TextEditor):
+    """
+    Back-translation with a single local NLLB model (Facebook NLLB-200 checkpoints).
+
+    Expects ``transformers.models.nllb.NllbTokenizer`` (not ``AutoTokenizer``), because the
+    generic fast wrapper omits correct source-language template tokens.
+
+    Long inputs are chunked so inference respects model limits and avoids HTTP APIs (~500-char caps).
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        model,
+        *,
+        device: str,
+        source_lang: str = "eng_Latn",
+        pivot_lang: str = "zho_Hans",
+        max_chunk_chars: int = 420,
+        generation_max_length: int = 512,
+        num_beams: int = 4,
+    ) -> None:
+        self.tokenizer = tokenizer
+        self.model = model.eval()
+        self.source_lang = source_lang
+        self.pivot_lang = pivot_lang
+        self.max_chunk_chars = max(64, int(max_chunk_chars))
+        self.generation_max_length = int(generation_max_length)
+        self.num_beams = max(1, int(num_beams))
+        self.device = device
+
+    def _torch_device(self):
+        dev = self.device
+        if isinstance(dev, str) and dev == "cuda" and torch.cuda.is_available():
+            return torch.device("cuda")
+        return dev
+
+    @staticmethod
+    def _chunks_by_length(text: str, max_chars: int) -> list[str]:
+        text = text.strip()
+        if not text:
+            return []
+        sentences = sent_tokenize(text)
+        chunks: list[str] = []
+        buf = ""
+        for sent in sentences:
+            st = sent.strip()
+            if not st:
+                continue
+            sep = " " if buf else ""
+            if len(buf) + len(sep) + len(st) <= max_chars:
+                buf += sep + st
+            else:
+                if buf:
+                    chunks.append(buf)
+                if len(st) <= max_chars:
+                    buf = st
+                    continue
+                start = 0
+                buf = ""
+                while start < len(st):
+                    end = min(start + max_chars, len(st))
+                    chunks.append(st[start:end])
+                    start = end
+        if buf:
+            chunks.append(buf)
+        return chunks
+
+    def _translate_span(self, text: str, src_code: str, tgt_code: str) -> str:
+        self.tokenizer.src_lang = src_code
+        enc = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        tdev = self._torch_device()
+        enc = {k: v.to(tdev) for k, v in enc.items()}
+        bos = _nllb_forced_bos_token_id(self.tokenizer, tgt_code)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **enc,
+                forced_bos_token_id=bos,
+                max_length=self.generation_max_length,
+                num_beams=self.num_beams,
+            )
+        return self.tokenizer.decode(out[0], skip_special_tokens=True).strip()
+
+    def edit(self, text: str, reference=None):
+        raw = "" if text is None else str(text).strip()
+        if not raw:
+            return raw
+        src, piv = self.source_lang, self.pivot_lang
+        if src == piv:
+            return raw
+
+        outs: list[str] = []
+        for chunk in self._chunks_by_length(raw, self.max_chunk_chars):
+            mid = self._translate_span(chunk, src, piv)
+            if not mid.strip():
+                mid = chunk
+            back = self._translate_span(mid, piv, src)
+            outs.append(back if back.strip() else chunk)
+        return " ".join(outs)
+

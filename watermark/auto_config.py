@@ -46,7 +46,8 @@ CONFIG_MAPPING_NAMES = {
     "KSEMSTAMP": 'watermark.k_semstamp.KSemStampConfig',
     "SEMSTAMP": 'watermark.semstamp.SemStampConfig',
     "IE": "watermark.ie.IEConfig",
-    "ETHWatermark": "watermark.eth_watermark.ETHWatermarkConfig"
+    "ETHWatermark": "watermark.eth_watermark.ETHWatermarkConfig",
+    "SegmentWM": "watermark.segment_wm.SegmentWMConfig",
 }
 
 
